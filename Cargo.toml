@@ -1,0 +1,18 @@
+[package]
+name = "mp3viewer"
+version = "0.1.0"
+edition = "2021"
+description = "MP3 metadata viewer/editor with directory-based album/artist tagging and genre candidate management"
+
+[dependencies]
+eframe = "0.29"
+lofty = "0.22"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+dirs = "5"
+
+[profile.release]
+opt-level = 3
+lto = true
