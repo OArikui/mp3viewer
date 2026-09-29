@@ -1,25 +1,42 @@
 //! MP3 Viewer — MP3メタデータの参照・編集ツール
 //!
-//! 機能:
+//! v0.1.0 の機能:
 //!  1. メタデータの参照・編集
 //!  2. 指定ディレクトリ内のmp3ファイル取得(再帰)
 //!  3. デフォルトディレクトリの設定
 //!  4. ディレクトリ構成によるアルバム/アーティスト設定とメタデータ書き込み
 //!  5. ジャンル候補(説明付き)JSONの作成
 //!  6. ジャンル候補のインポート/エクスポート
+//!
+//! v0.2.0 で追加:
+//!  7. ファイル一覧でのクイックルック(ジャンル・アーティスト・アルバム・リリース年)
+//!  8. ジャンル/アルバム/追加日/リリース年/アーティスト/曲名頭文字によるグループ表示・並び替え
+//!  9. 曲名・アーティスト・アルバム・ジャンル・ファイル名を対象とした検索機能
+//!
+//! v0.3.0 で追加:
+//! 10. ファイル一覧をテーブル表示に変更(列ごとにメタデータを表示)
+//! 11. アーティスト・ファイル(メディア)・アルバムの埋め込み画像をサムネイル表示
+//!     (ID3 APICのPictureType: Artist/LeadArtist・Media・CoverFrontをそれぞれ使用)
 
+use chrono::{DateTime, Local};
 use eframe::egui;
+use egui_extras::{Column, TableBuilder};
 use lofty::config::WriteOptions;
+use lofty::picture::PictureType;
 use lofty::prelude::*;
 use lofty::tag::{ItemKey, Tag};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 use walkdir::WalkDir;
 
 const APP_NAME: &str = "MP3 Viewer";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GENRE_FORMAT_VERSION: u32 = 1;
+const THUMB_MAX_PX: u32 = 64;
+const THUMB_DISPLAY_PX: f32 = 32.0;
 
 // ---------------------------------------------------------------------------
 // 設定 / ジャンル候補の保存
@@ -118,7 +135,7 @@ fn genres_json(genres: &[Genre]) -> Result<String, String> {
     serde_json::to_string_pretty(&file).map_err(|e| e.to_string())
 }
 
-/// genres.json が無ければ既定内容で作成する(⑤)
+/// genres.json が無ければ既定内容で作成する
 fn load_or_create_genres() -> Vec<Genre> {
     if let Ok(text) = fs::read_to_string(genres_path()) {
         if let Ok(parsed) = serde_json::from_str::<GenreImport>(&text) {
@@ -148,7 +165,19 @@ struct Meta {
     track: String,
 }
 
-fn read_meta(path: &Path) -> Result<(Meta, String), String> {
+/// 1ファイル分の読み込み結果(メタデータ・再生情報・埋め込み画像)
+struct Loaded {
+    meta: Meta,
+    info: String,
+    /// アルバム(表紙)画像。CoverFrontが無ければ埋め込み画像のうち最初のものを流用
+    album_pic: Option<Vec<u8>>,
+    /// アーティスト画像(PictureType::Artist / LeadArtist)
+    artist_pic: Option<Vec<u8>>,
+    /// メディア(盤面など)画像(PictureType::Media)
+    media_pic: Option<Vec<u8>>,
+}
+
+fn read_meta(path: &Path) -> Result<Loaded, String> {
     let tf = lofty::read_from_path(path).map_err(|e| e.to_string())?;
     let props = tf.properties();
     let secs = props.duration().as_secs();
@@ -161,6 +190,10 @@ fn read_meta(path: &Path) -> Result<(Meta, String), String> {
     }
 
     let mut m = Meta::default();
+    let mut album_pic: Option<Vec<u8>> = None;
+    let mut artist_pic: Option<Vec<u8>> = None;
+    let mut media_pic: Option<Vec<u8>> = None;
+
     if let Some(tag) = tf.primary_tag().or_else(|| tf.first_tag()) {
         m.title = tag.title().map(|s| s.to_string()).unwrap_or_default();
         m.artist = tag.artist().map(|s| s.to_string()).unwrap_or_default();
@@ -172,8 +205,41 @@ fn read_meta(path: &Path) -> Result<(Meta, String), String> {
             .to_string();
         m.year = tag.year().map(|y| y.to_string()).unwrap_or_default();
         m.track = tag.track().map(|t| t.to_string()).unwrap_or_default();
+
+        for pic in tag.pictures() {
+            match pic.pic_type() {
+                PictureType::CoverFront => {
+                    if album_pic.is_none() {
+                        album_pic = Some(pic.data().to_vec());
+                    }
+                }
+                PictureType::Artist | PictureType::LeadArtist => {
+                    if artist_pic.is_none() {
+                        artist_pic = Some(pic.data().to_vec());
+                    }
+                }
+                PictureType::Media => {
+                    if media_pic.is_none() {
+                        media_pic = Some(pic.data().to_vec());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if album_pic.is_none() {
+            if let Some(p) = tag.pictures().first() {
+                album_pic = Some(p.data().to_vec());
+            }
+        }
     }
-    Ok((m, info))
+
+    Ok(Loaded {
+        meta: m,
+        info,
+        album_pic,
+        artist_pic,
+        media_pic,
+    })
 }
 
 /// タグを読み込み、`f` で書き換えて保存する(タグが無ければ新規作成)
@@ -292,6 +358,206 @@ fn derive_from_dir(root: &Path, file: &Path) -> (Option<String>, Option<String>)
     }
 }
 
+fn file_added_time(path: &Path) -> SystemTime {
+    fs::metadata(path)
+        .and_then(|m| m.created().or_else(|_| m.modified()))
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+fn format_added(t: SystemTime) -> String {
+    let dt: DateTime<Local> = t.into();
+    dt.format("%Y-%m-%d").to_string()
+}
+
+/// 埋め込み画像のバイト列をデコードし、正方形に収まるサムネイルへ縮小する
+fn decode_thumb(bytes: &[u8], max: u32) -> Option<egui::ColorImage> {
+    let img = image::load_from_memory(bytes).ok()?.thumbnail(max, max).to_rgba8();
+    let w = img.width() as usize;
+    let h = img.height() as usize;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], img.as_raw()))
+}
+
+// ---------------------------------------------------------------------------
+// ファイル一覧のエントリ(クイックルック用にメタデータをキャッシュ)
+// ---------------------------------------------------------------------------
+
+struct FileEntry {
+    path: PathBuf,
+    rel: String,
+    added: SystemTime,
+    meta: Meta,
+    info: String,
+    album_pic: Option<Vec<u8>>,
+    artist_pic: Option<Vec<u8>>,
+    media_pic: Option<Vec<u8>>,
+    /// 検索用に小文字化した rel/title/artist/album/genre の連結文字列
+    search_blob: String,
+}
+
+fn build_search_blob(rel: &str, m: &Meta) -> String {
+    format!("{} {} {} {} {}", rel, m.title, m.artist, m.album, m.genre).to_lowercase()
+}
+
+fn build_entry(root: &Path, path: PathBuf) -> FileEntry {
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .to_string();
+    let loaded = read_meta(&path).unwrap_or_else(|e| Loaded {
+        meta: Meta::default(),
+        info: format!("(読み込みエラー: {e})"),
+        album_pic: None,
+        artist_pic: None,
+        media_pic: None,
+    });
+    let added = file_added_time(&path);
+    let search_blob = build_search_blob(&rel, &loaded.meta);
+    FileEntry {
+        path,
+        rel,
+        added,
+        meta: loaded.meta,
+        info: loaded.info,
+        album_pic: loaded.album_pic,
+        artist_pic: loaded.artist_pic,
+        media_pic: loaded.media_pic,
+        search_blob,
+    }
+}
+
+fn dash_if_empty(s: &str) -> &str {
+    let t = s.trim();
+    if t.is_empty() {
+        "-"
+    } else {
+        t
+    }
+}
+
+fn empty_or(s: &str, fallback: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() {
+        fallback.to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// テーブルの曲名セルに表示するタイトル(未設定ならファイル名を代用)
+fn display_title(e: &FileEntry) -> String {
+    if e.meta.title.trim().is_empty() {
+        Path::new(&e.rel)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| e.rel.clone())
+    } else {
+        e.meta.title.clone()
+    }
+}
+
+fn title_initial(e: &FileEntry) -> String {
+    let base = if !e.meta.title.trim().is_empty() {
+        e.meta.title.trim().to_string()
+    } else {
+        Path::new(&e.rel)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default()
+    };
+    match base.chars().find(|c| c.is_alphanumeric()) {
+        Some(c) => c.to_uppercase().collect::<String>(),
+        None => "#".to_string(),
+    }
+}
+
+/// 並び替え・グループ表示のキー
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortKey {
+    FileName,
+    Genre,
+    Artist,
+    Album,
+    AddedDate,
+    ReleaseDate,
+    TitleInitial,
+}
+
+impl SortKey {
+    const ALL: [SortKey; 7] = [
+        SortKey::FileName,
+        SortKey::Genre,
+        SortKey::Artist,
+        SortKey::Album,
+        SortKey::AddedDate,
+        SortKey::ReleaseDate,
+        SortKey::TitleInitial,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SortKey::FileName => "ファイル名順(グループなし)",
+            SortKey::Genre => "ジャンル別",
+            SortKey::Artist => "アーティスト別",
+            SortKey::Album => "アルバム別",
+            SortKey::AddedDate => "追加日別",
+            SortKey::ReleaseDate => "リリース年別",
+            SortKey::TitleInitial => "曲名頭文字別",
+        }
+    }
+}
+
+fn group_label(e: &FileEntry, key: SortKey) -> String {
+    match key {
+        SortKey::FileName => String::new(),
+        SortKey::Genre => empty_or(&e.meta.genre, "(ジャンル未設定)"),
+        SortKey::Artist => empty_or(&e.meta.artist, "(アーティスト未設定)"),
+        SortKey::Album => empty_or(&e.meta.album, "(アルバム未設定)"),
+        SortKey::AddedDate => format_added(e.added),
+        SortKey::ReleaseDate => empty_or(&e.meta.year, "(年不明)"),
+        SortKey::TitleInitial => title_initial(e),
+    }
+}
+
+/// サムネイルの種別(いずれもID3 APICのPictureTypeに対応)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThumbKind {
+    Artist,
+    Media,
+    Album,
+}
+
+/// テーブル1行分の描画用データ(クロージャ内でselfを借用しないよう事前に構築する)
+struct RowView {
+    idx: usize,
+    group_header: Option<String>,
+    artist_tex: Option<egui::TextureHandle>,
+    media_tex: Option<egui::TextureHandle>,
+    album_tex: Option<egui::TextureHandle>,
+    title: String,
+    artist: String,
+    album: String,
+    genre: String,
+    year: String,
+}
+
+fn show_thumb(ui: &mut egui::Ui, tex: &Option<egui::TextureHandle>) {
+    match tex {
+        Some(t) => {
+            ui.add(
+                egui::Image::new((t.id(), t.size_vec2()))
+                    .fit_to_exact_size(egui::vec2(THUMB_DISPLAY_PX, THUMB_DISPLAY_PX)),
+            );
+        }
+        None => {
+            ui.weak("–");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GUI
 // ---------------------------------------------------------------------------
@@ -318,10 +584,9 @@ struct App {
     cfg: Config,
     genres: Vec<Genre>,
     root: Option<PathBuf>,
-    files: Vec<PathBuf>,
-    /// (表示用相対パス, 小文字化した検索用文字列)
-    labels: Vec<(String, String)>,
-    filter: String,
+    entries: Vec<FileEntry>,
+    search: String,
+    sort_key: SortKey,
     selected: Option<usize>,
     meta: Meta,
     orig: Meta,
@@ -332,6 +597,9 @@ struct App {
     pending: Option<Pending>,
     also_album_artist: bool,
     show_about: bool,
+    artist_thumbs: HashMap<usize, Option<egui::TextureHandle>>,
+    media_thumbs: HashMap<usize, Option<egui::TextureHandle>>,
+    album_thumbs: HashMap<usize, Option<egui::TextureHandle>>,
 }
 
 impl App {
@@ -342,9 +610,9 @@ impl App {
             cfg: cfg.clone(),
             genres,
             root: None,
-            files: vec![],
-            labels: vec![],
-            filter: String::new(),
+            entries: vec![],
+            search: String::new(),
+            sort_key: SortKey::FileName,
             selected: None,
             meta: Meta::default(),
             orig: Meta::default(),
@@ -355,6 +623,9 @@ impl App {
             pending: None,
             also_album_artist: true,
             show_about: false,
+            artist_thumbs: HashMap::new(),
+            media_thumbs: HashMap::new(),
+            album_thumbs: HashMap::new(),
         };
         if let Some(d) = cfg.default_dir {
             let p = PathBuf::from(d);
@@ -366,43 +637,76 @@ impl App {
     }
 
     fn open_dir(&mut self, dir: PathBuf) {
-        self.files = scan_mp3(&dir);
-        self.labels = self
-            .files
-            .iter()
-            .map(|f| {
-                let rel = f
-                    .strip_prefix(&dir)
-                    .unwrap_or(f)
-                    .to_string_lossy()
-                    .to_string();
-                let lc = rel.to_lowercase();
-                (rel, lc)
-            })
-            .collect();
-        self.status = format!("{} 個のmp3を取得: {}", self.files.len(), dir.display());
+        let paths = scan_mp3(&dir);
+        self.entries = paths.into_iter().map(|p| build_entry(&dir, p)).collect();
+        self.status = format!("{} 個のmp3を取得: {}", self.entries.len(), dir.display());
         self.root = Some(dir);
         self.selected = None;
         self.meta = Meta::default();
         self.orig = Meta::default();
         self.info.clear();
+        self.artist_thumbs.clear();
+        self.media_thumbs.clear();
+        self.album_thumbs.clear();
     }
 
     fn select(&mut self, idx: usize) {
-        let Some(path) = self.files.get(idx).cloned() else {
+        let Some(e) = self.entries.get(idx) else {
             return;
         };
-        match read_meta(&path) {
-            Ok((m, info)) => {
-                self.meta = m.clone();
-                self.orig = m;
-                self.info = info;
-                self.selected = Some(idx);
-            }
-            Err(e) => {
-                self.status = format!("読み込み失敗: {} ({})", path.display(), e);
+        self.meta = e.meta.clone();
+        self.orig = e.meta.clone();
+        self.info = e.info.clone();
+        self.selected = Some(idx);
+    }
+
+    /// ディスクから再読込してキャッシュを更新する(保存/一括書き込み後に使用)
+    fn refresh_entry(&mut self, idx: usize) {
+        if let Some(e) = self.entries.get_mut(idx) {
+            if let Ok(loaded) = read_meta(&e.path) {
+                e.search_blob = build_search_blob(&e.rel, &loaded.meta);
+                e.meta = loaded.meta;
+                e.info = loaded.info;
+                e.album_pic = loaded.album_pic;
+                e.artist_pic = loaded.artist_pic;
+                e.media_pic = loaded.media_pic;
             }
         }
+        self.artist_thumbs.remove(&idx);
+        self.media_thumbs.remove(&idx);
+        self.album_thumbs.remove(&idx);
+    }
+
+    /// サムネイルテクスチャを取得する(初回のみデコードし、以降はキャッシュを返す)
+    fn get_thumb(&mut self, ctx: &egui::Context, idx: usize, kind: ThumbKind) -> Option<egui::TextureHandle> {
+        let kind_str = match kind {
+            ThumbKind::Artist => "artist",
+            ThumbKind::Media => "media",
+            ThumbKind::Album => "album",
+        };
+        let cache = match kind {
+            ThumbKind::Artist => &mut self.artist_thumbs,
+            ThumbKind::Media => &mut self.media_thumbs,
+            ThumbKind::Album => &mut self.album_thumbs,
+        };
+        if let Some(v) = cache.get(&idx) {
+            return v.clone();
+        }
+        let bytes = match kind {
+            ThumbKind::Artist => self.entries.get(idx).and_then(|e| e.artist_pic.as_ref()),
+            ThumbKind::Media => self.entries.get(idx).and_then(|e| e.media_pic.as_ref()),
+            ThumbKind::Album => self.entries.get(idx).and_then(|e| e.album_pic.as_ref()),
+        };
+        let tex = bytes.and_then(|b| decode_thumb(b, THUMB_MAX_PX)).map(|img| {
+            ctx.load_texture(format!("thumb-{kind_str}-{idx}"), img, egui::TextureOptions::default())
+        });
+        let cache = match kind {
+            ThumbKind::Artist => &mut self.artist_thumbs,
+            ThumbKind::Media => &mut self.media_thumbs,
+            ThumbKind::Album => &mut self.album_thumbs,
+        };
+        cache.insert(idx, tex.clone());
+        tex
     }
 
     fn set_default_dir(&mut self) {
@@ -418,12 +722,19 @@ impl App {
     }
 
     fn save_current(&mut self) {
-        let Some(path) = self.selected.and_then(|i| self.files.get(i).cloned()) else {
+        let Some(idx) = self.selected else {
+            return;
+        };
+        let Some(path) = self.entries.get(idx).map(|e| e.path.clone()) else {
             return;
         };
         match write_meta(&path, &self.meta) {
             Ok(_) => {
-                self.orig = self.meta.clone();
+                self.refresh_entry(idx);
+                if let Some(e) = self.entries.get(idx) {
+                    self.orig = e.meta.clone();
+                    self.info = e.info.clone();
+                }
                 self.status = format!("保存しました: {}", path.display());
             }
             Err(e) => self.status = format!("保存失敗: {e}"),
@@ -434,17 +745,18 @@ impl App {
         let Some(root) = self.root.clone() else {
             return;
         };
-        let targets: Vec<PathBuf> = if p.all {
-            self.files.clone()
+        let targets: Vec<usize> = if p.all {
+            (0..self.entries.len()).collect()
         } else {
-            self.selected
-                .and_then(|i| self.files.get(i).cloned())
-                .into_iter()
-                .collect()
+            self.selected.into_iter().collect()
         };
+        let also = self.also_album_artist;
         let (mut ok, mut skipped, mut failed) = (0usize, 0usize, 0usize);
-        for path in &targets {
-            let (artist, album) = derive_from_dir(&root, path);
+        for &i in &targets {
+            let Some(path) = self.entries.get(i).map(|e| e.path.clone()) else {
+                continue;
+            };
+            let (artist, album) = derive_from_dir(&root, &path);
             let value = match p.kind {
                 BulkKind::Album => album,
                 BulkKind::Artist => artist,
@@ -454,8 +766,7 @@ impl App {
                 continue;
             };
             let kind = p.kind;
-            let also = self.also_album_artist;
-            let r = patch_tag(path, move |t| match kind {
+            let r = patch_tag(&path, move |t| match kind {
                 BulkKind::Album => t.set_album(v),
                 BulkKind::Artist => {
                     t.set_artist(v.clone());
@@ -465,7 +776,10 @@ impl App {
                 }
             });
             match r {
-                Ok(_) => ok += 1,
+                Ok(_) => {
+                    ok += 1;
+                    self.refresh_entry(i);
+                }
                 Err(_) => failed += 1,
             }
         }
@@ -541,7 +855,9 @@ impl App {
         else {
             return;
         };
-        self.status = match genres_json(&self.genres).and_then(|j| fs::write(&p, j).map_err(|e| e.to_string())) {
+        self.status = match genres_json(&self.genres)
+            .and_then(|j| fs::write(&p, j).map_err(|e| e.to_string()))
+        {
             Ok(_) => format!("エクスポートしました: {}", p.display()),
             Err(e) => format!("エクスポート失敗: {e}"),
         };
@@ -554,7 +870,7 @@ impl App {
             ui.label("左のリストからmp3ファイルを選択してください");
             return;
         };
-        let Some(path) = self.files.get(sel).cloned() else {
+        let Some(path) = self.entries.get(sel).map(|e| e.path.clone()) else {
             return;
         };
         ui.heading(
@@ -613,7 +929,7 @@ impl App {
             }
         });
 
-        // ---- ディレクトリ構成からの設定 (④) ----
+        // ---- ディレクトリ構成からの設定 ----
         ui.add_space(12.0);
         ui.separator();
         ui.strong("ディレクトリ構成からの設定");
@@ -799,32 +1115,142 @@ impl eframe::App for App {
             });
         });
 
-        // ---- 左: ファイル一覧 ----
+        // ---- 左: ファイル一覧(テーブル表示・サムネイル・検索・グループ表示) ----
         let mut clicked: Option<usize> = None;
         egui::SidePanel::left("files")
             .resizable(true)
-            .default_width(380.0)
+            .default_width(640.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label("絞り込み");
-                    ui.text_edit_singleline(&mut self.filter);
+                    ui.label("検索");
+                    ui.text_edit_singleline(&mut self.search);
                 });
-                let q = self.filter.to_lowercase();
-                let visible: Vec<usize> = (0..self.labels.len())
-                    .filter(|&i| q.is_empty() || self.labels[i].1.contains(&q))
+                ui.weak("曲名・アーティスト・アルバム・ジャンル・ファイル名が対象です");
+
+                egui::ComboBox::from_label("表示順 / グループ")
+                    .selected_text(self.sort_key.label())
+                    .show_ui(ui, |ui| {
+                        for k in SortKey::ALL {
+                            ui.selectable_value(&mut self.sort_key, k, k.label());
+                        }
+                    });
+
+                // ---- 表示対象の絞り込み・並び替え ----
+                let q = self.search.trim().to_lowercase();
+                let key = self.sort_key;
+                let mut visible: Vec<usize> = (0..self.entries.len())
+                    .filter(|&i| q.is_empty() || self.entries[i].search_blob.contains(&q))
                     .collect();
-                ui.weak(format!("{} / {} 件", visible.len(), self.labels.len()));
+                if key == SortKey::FileName {
+                    visible.sort_by(|&a, &b| self.entries[a].rel.cmp(&self.entries[b].rel));
+                } else {
+                    visible.sort_by(|&a, &b| {
+                        let la = group_label(&self.entries[a], key);
+                        let lb = group_label(&self.entries[b], key);
+                        la.cmp(&lb).then_with(|| self.entries[a].rel.cmp(&self.entries[b].rel))
+                    });
+                }
+                ui.weak(format!("{} / {} 件", visible.len(), self.entries.len()));
                 ui.separator();
-                let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show_rows(ui, row_h, visible.len(), |ui, range| {
-                        for row in range {
-                            let i = visible[row];
-                            let sel = self.selected == Some(i);
-                            if ui.selectable_label(sel, self.labels[i].0.clone()).clicked() {
-                                clicked = Some(i);
+
+                // ---- テーブル行の描画用データを事前に構築(サムネイル読込を含む) ----
+                let render_ctx = ui.ctx().clone();
+                let mut rows: Vec<RowView> = Vec::with_capacity(visible.len());
+                let mut last_label: Option<String> = None;
+                for &i in &visible {
+                    let mut header = None;
+                    if key != SortKey::FileName {
+                        let lbl = group_label(&self.entries[i], key);
+                        if last_label.as_ref() != Some(&lbl) {
+                            header = Some(lbl.clone());
+                            last_label = Some(lbl);
+                        }
+                    }
+                    let artist_tex = self.get_thumb(&render_ctx, i, ThumbKind::Artist);
+                    let media_tex = self.get_thumb(&render_ctx, i, ThumbKind::Media);
+                    let album_tex = self.get_thumb(&render_ctx, i, ThumbKind::Album);
+                    let e = &self.entries[i];
+                    rows.push(RowView {
+                        idx: i,
+                        group_header: header,
+                        artist_tex,
+                        media_tex,
+                        album_tex,
+                        title: display_title(e),
+                        artist: dash_if_empty(&e.meta.artist).to_string(),
+                        album: dash_if_empty(&e.meta.album).to_string(),
+                        genre: dash_if_empty(&e.meta.genre).to_string(),
+                        year: dash_if_empty(&e.meta.year).to_string(),
+                    });
+                }
+                let selected = self.selected;
+
+                // ---- テーブル本体(この中では self を参照しない: rows/selected/clicked のみ使用) ----
+                TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::exact(THUMB_DISPLAY_PX + 6.0))
+                    .column(Column::exact(THUMB_DISPLAY_PX + 6.0))
+                    .column(Column::exact(THUMB_DISPLAY_PX + 6.0))
+                    .column(Column::initial(160.0).at_least(80.0))
+                    .column(Column::initial(120.0).at_least(60.0))
+                    .column(Column::initial(120.0).at_least(60.0))
+                    .column(Column::initial(90.0).at_least(50.0))
+                    .column(Column::initial(50.0).at_least(40.0))
+                    .header(22.0, |mut header| {
+                        header.col(|ui| { ui.strong("アーティスト"); });
+                        header.col(|ui| { ui.strong("ファイル"); });
+                        header.col(|ui| { ui.strong("アルバム"); });
+                        header.col(|ui| { ui.strong("曲名"); });
+                        header.col(|ui| { ui.strong("アーティスト"); });
+                        header.col(|ui| { ui.strong("アルバム"); });
+                        header.col(|ui| { ui.strong("ジャンル"); });
+                        header.col(|ui| { ui.strong("年"); });
+                    })
+                    .body(|mut body| {
+                        for r in &rows {
+                            if let Some(lbl) = &r.group_header {
+                                body.row(20.0, |mut row| {
+                                    row.col(|ui| { ui.strong(lbl.as_str()); });
+                                    row.col(|_ui| {});
+                                    row.col(|_ui| {});
+                                    row.col(|_ui| {});
+                                    row.col(|_ui| {});
+                                    row.col(|_ui| {});
+                                    row.col(|_ui| {});
+                                    row.col(|_ui| {});
+                                });
                             }
+                            body.row(THUMB_DISPLAY_PX + 6.0, |mut row| {
+                                row.col(|ui| show_thumb(ui, &r.artist_tex));
+                                row.col(|ui| show_thumb(ui, &r.media_tex));
+                                row.col(|ui| show_thumb(ui, &r.album_tex));
+                                row.col(|ui| {
+                                    if ui
+                                        .selectable_label(selected == Some(r.idx), r.title.as_str())
+                                        .clicked()
+                                    {
+                                        clicked = Some(r.idx);
+                                    }
+                                });
+                                row.col(|ui| { ui.label(r.artist.as_str()); });
+                                row.col(|ui| { ui.label(r.album.as_str()); });
+                                row.col(|ui| { ui.label(r.genre.as_str()); });
+                                row.col(|ui| { ui.label(r.year.as_str()); });
+                            });
+                        }
+                        if rows.is_empty() {
+                            body.row(20.0, |mut row| {
+                                row.col(|ui| { ui.weak("該当するファイルがありません"); });
+                                row.col(|_ui| {});
+                                row.col(|_ui| {});
+                                row.col(|_ui| {});
+                                row.col(|_ui| {});
+                                row.col(|_ui| {});
+                                row.col(|_ui| {});
+                                row.col(|_ui| {});
+                            });
                         }
                     });
             });
@@ -848,7 +1274,7 @@ impl eframe::App for App {
         // ---- 一括書き込みの確認 ----
         if let Some(p) = self.pending {
             let n = if p.all {
-                self.files.len()
+                self.entries.len()
             } else if self.selected.is_some() {
                 1
             } else {
@@ -949,7 +1375,7 @@ fn main() -> eframe::Result<()> {
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 720.0])
+            .with_inner_size([1360.0, 780.0])
             .with_title(format!("{APP_NAME} v{APP_VERSION}")),
         ..Default::default()
     };

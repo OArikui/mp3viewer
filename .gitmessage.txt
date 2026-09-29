@@ -1,0 +1,21 @@
+<type>(<scope>): <subject>
+
+<body>
+
+<footer>
+
+# ── コミットメッセージの書き方 ─────────────────────────────
+# 1行目: <type>(<scope>): <subject>
+#   type  : feat | fix | docs | style | refactor | perf | test | chore | build | ci
+#   scope : editor | genre | dirmeta | list | config | docs 等、変更箇所を短く
+#   subject: 命令形・現在形で要約(例: 追加する/修正する ではなく 追加/修正)
+#            50文字程度、末尾のピリオドなし
+#
+# 空行を1つ挟んで本文(body): 何を・なぜ変更したか。How ではなく What/Why を書く
+#
+# 空行を1つ挟んでフッター(footer): 破壊的変更や関連Issueなど
+#   例: BREAKING CHANGE: genres.json のトップレベル形式を配列からオブジェクトに変更
+#   例: Refs #12
+#
+# 詳細は docs/COMMIT_CONVENTION.md を参照してください。
+# ────────────────────────────────────────────────────────

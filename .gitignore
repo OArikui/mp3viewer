@@ -1,1 +1,16 @@
+# ビルド成果物
 /target
+
+# エディタ/OS由来の一時ファイル
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ローカル実行時の設定(config.json / genres.json はOS標準の config ディレクトリに
+# 保存されるためリポジトリ内には生成されないが、念のため除外)
+/config.json
+/genres.json
+
+# 注意: このプロジェクトはバイナリ(アプリケーション)のため、
+# Cargo.lock はビルド再現性のためコミットしてください(ignoreしない)。

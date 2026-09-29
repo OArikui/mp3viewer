@@ -1,17 +1,20 @@
 [package]
 name = "mp3viewer"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
-description = "MP3 metadata viewer/editor with directory-based album/artist tagging and genre candidate management"
+description = "MP3 metadata viewer/editor with a table-based file list, embedded artist/album/media thumbnails, directory-based album/artist tagging, genre candidate management, and grouping/search"
 
 [dependencies]
 eframe = "0.29"
+egui_extras = "0.29"
 lofty = "0.22"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"
 dirs = "5"
+chrono = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [profile.release]
 opt-level = 3
